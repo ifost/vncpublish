@@ -1,5 +1,7 @@
 #!/usr/local/bin/expect
 
+# $Id$
+
 set required_params [list server destination baseurl]
 
 set params(tempdir) /tmp/vncpublish.[pid]
@@ -41,7 +43,7 @@ if {[regexp {^sftp://(.*)/(.*)$} $params(destination) destserver destdir]} {
 # Ready, steady, go!
 
 file mkdir $params(tempdir)
-spawn vncsnapshot $params(server) -count 10000000 -fps 1 $params(tempdir)/snap
+spawn vncsnapshot -count 10000000 -fps 1 $params(server) $params(tempdir)/snap
 set vncsnap $spawn_id
 
 spawn sftp $destserver
@@ -82,6 +84,8 @@ proc get_password {who what id} {
     stty echo
 }
 
+######################################################################
+# The main loop...
 
 while {1} {
     expect {
