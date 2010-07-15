@@ -1,0 +1,98 @@
+#!/usr/local/bin/expect
+
+set required_params [list server destination baseurl]
+
+set params(tempdir) /tmp/vncpublish.[pid]
+
+proc die {message} { puts stderr $message ;  exit 1 }
+
+# Parse command-line arguments
+while {[llength $argv] > 0} {
+    set arg1 [lindex $argv 0]
+    set arg2 [lindex $argv 1]
+    set argv [lrange $argv 2 end]
+    switch $arg1 {
+	server      { set params(server)      $arg2 }
+	destination { set params(destination) $arg2 }
+	baseurl     { set params(baseurl)     $arg2 }
+	tempdir     { set params(tempdir)     $arg2 }
+	default     { die "Unknown argument: $arg1" }
+    }
+}
+
+# Check that we have all necessary parameters
+foreach p {server destination baseurl} {
+    if {[info exists params($p)]} { 
+    } else { 
+	puts stderr "$p must be specified"; exit 1 
+    }
+}
+
+# Check that the destination is OK
+if {[regexp {^sftp://(.*)/(.*)$} $params(destination) destserver destdir]} {
+    # sftp connection, no problems
+} else {
+    die "Unknown destination format. Currently supported formats are: sftp"
+}
+
+
+
+######################################################################
+# Ready, steady, go!
+
+file mkdir $params(tempdir)
+spawn vncsnapshot $params(server) -count 10000000 -fps 1 $params(tempdir)/snap
+set vncsnap $spawn_id
+
+spawn sftp $destserver
+set sftp $spawn_id
+set destserver_cd no
+
+
+######################################################################
+set file_upload_list {}
+set ready_to_send no
+
+proc upload_next_file {} {
+    global file_upload_list
+    global ready_to_send
+    if {[string is false $destserver_cd]} {
+	send "cd /$destdir\n"
+	# Assume that it works, we'll find out soon enough
+	set ready_to_send false
+	return
+    }
+    if {[llength file_upload_list] > 0} {
+	set first_file [lindex $file_upload_list 0]
+	set file_upload_list [lrange $file_upload_list 1 end]
+	send -i $sftp "put $first_file\n"
+	set ready_to_send false
+	return
+    }
+}
+
+proc get_password {who what id} {
+    # Should I be putting this into the loop below? Or does that become too
+    # complicated?
+    stty -echo
+    send_user "$what password for $who: "
+    expect_user -re "(.*)\n"
+    send_user "\n"
+    send -i $id "$expect_out(1,string)\n"
+    stty echo
+}
+
+
+while {1} {
+    expect {
+	-i $vncsnap assword: { get_password $params(server) VNC $vncsnap }
+	-i $sftp assword {     get_password $destserver SFTP $sftp }
+	-i $sftp "Connection refused" { die "Could not connect to $destserver via sftp" }
+	-i $sftp "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED" { die "Unable to connect to $destserver because the .ssh/known_hosts file does not match received ID"
+	}
+	-i $sftp "The authenticity of host" { send -i $sftp "yes\n" }
+	-i $vncsnap "VNC authentication succeeded" { }
+	-i $sftp "sftp>" { set ready_to_send true ; upload_next_file }
+	timeout { die "Timeout waiting for response" }
+    }
+}
