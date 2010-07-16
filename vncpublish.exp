@@ -2,6 +2,13 @@
 
 # $Id$
 
+set micro_image_width 64
+set micro_image_height 64
+set cropsize "${micro_image_width}x${micro_image_height}"
+
+set pause_between_frames 10
+   # in seconds
+
 set required_params [list server destination baseurl]
 
 set params(tempdir) /tmp/vncpublish.[pid]
@@ -31,7 +38,7 @@ foreach p {server destination baseurl} {
 }
 
 # Check that the destination is OK
-if {[regexp {^sftp://(.*)/(.*)$} $params(destination) destserver destdir]} {
+if {[regexp {^sftp://([^/]*)/(.*)$} $params(destination) patternmatch destserver destdir]} {
     # sftp connection, no problems
 } else {
     die "Unknown destination format. Currently supported formats are: sftp"
@@ -43,31 +50,58 @@ if {[regexp {^sftp://(.*)/(.*)$} $params(destination) destserver destdir]} {
 # Ready, steady, go!
 
 file mkdir $params(tempdir)
-spawn vncsnapshot -count 10000000 -fps 1 $params(server) $params(tempdir)/snap
+spawn vncsnapshot -count 10000000 \
+    -fps $pause_between_frames \
+    $params(server) $params(tempdir)/snap
 set vncsnap $spawn_id
 
 spawn sftp $destserver
 set sftp $spawn_id
 set destserver_cd no
 
+set imagemagicks {}
+set md5ings {}
+
 
 ######################################################################
 set file_upload_list {}
+ # Files which we want to send, but have not been sent yet
+
 set ready_to_send no
+ # Whether the sftp session is back at the sftp> prompt
+
+set completely_finished no
+ # Whether the VNC snapshot has shutdown
+
+######################################################################
 
 proc upload_next_file {} {
     global file_upload_list
     global ready_to_send
+    global completely_finished
+    global destserver_cd
+    global destdir
+    global sftp
+    if {[string is false $ready_to_send]} {
+	return
+    }
     if {[string is false $destserver_cd]} {
 	send "cd /$destdir\n"
 	# Assume that it works, we'll find out soon enough
 	set ready_to_send false
+	set destserver_cd yes
 	return
     }
-    if {[llength file_upload_list] > 0} {
+    puts "Working through file_upload_list of $file_upload_list"
+    if {[llength $file_upload_list] > 0} {
 	set first_file [lindex $file_upload_list 0]
 	set file_upload_list [lrange $file_upload_list 1 end]
 	send -i $sftp "put $first_file\n"
+	set ready_to_send false
+	return
+    }
+    if {[string is true $completely_finished]} {
+	send "exit\n"
 	set ready_to_send false
 	return
     }
@@ -84,6 +118,47 @@ proc get_password {who what id} {
     stty echo
 }
 
+proc create_html {shotnum} {
+    global frame
+    global params
+    global micro_image_width
+    global micro_image_height
+    global hashes
+    global invhashes
+    global file_upload_list
+    array set myframe $frame($shotnum)
+    set htmlpath $params(tempdir)/page$shotnum.html
+    set htmlfile [open $htmlpath w]
+    puts $htmlfile "<HTML><HEAD><TITLE>Page $shotnum</TITLE></HEAD>"
+    puts $htmlfile "<BODY><TABLE>"
+    set row_width [expr $myframe(screen_width) / $micro_image_width]
+    if {[expr $myframe(screen_width) % $micro_image_width] != 0} { incr row_width }
+    set num_rows [expr $myframe(screen_height) / $micro_image_height]
+    if {[expr $myframe(screen_height) % $micro_image_height] != 0} { incr row_height }
+    set counter 0
+    for {set y 0} {$y < $num_rows} {incr y} {
+	puts $htmlfile "<TR>"
+	for {set x 0} {$x < $row_width} {incr x} {
+	    #set img_tail [file tail 
+	    #set img_source $params(baseurl)/$frame($shotnum
+	    puts $htmlfile "<TD>"
+	    #puts $htmlfile "<IMG SRC="
+	    # HAVE TO FINISH THIS BIT!!!!!
+	    puts $htmlfile "</TD>"
+	}
+	puts $htmlfile "</TR>"
+    }
+    puts $htmlfile "</TABLE></BODY></HTML>"
+    close $htmlfile
+    lappend file_upload_list $htmlpath
+    upload_next_file
+    # Don't have to worry about following race condition; it's
+    # OK if we end up uploading a different index.html to the
+    # one we generate now.
+    file copy -force $htmlpath $params(tempdir)/index.html
+    lappend file_upload_list $params(tempdir)/index.html
+}
+
 ######################################################################
 # The main loop...
 
@@ -97,6 +172,64 @@ while {1} {
 	-i $sftp "The authenticity of host" { send -i $sftp "yes\n" }
 	-i $vncsnap "VNC authentication succeeded" { }
 	-i $sftp "sftp>" { set ready_to_send true ; upload_next_file }
+	-i $vncsnap -regexp {Image saved from .* (\d*)x(\d*) screen to (.*)(\d*).jpg using (\d*)x(\d*)\+(\d*)\+(\d*) rectangle} {
+	    set screen_width $expect_out(1,string)
+	    set screen_height $expect_out(2,string)
+	    set basename $expect_out(3,string)
+	    set shotnum $expect_out(4,string)
+	    set filename "$basename$shotnum.jpg"
+	    set rect_width $expect_out(5,string)
+	    set rect_height $expect_out(6,string)
+	    set rect_x_offset $expect_out(7,string)
+	    set rect_y_offset $expect_out(8,string)
+	    if {[llength $imagemagicks] < 3} {
+		spawn convert -crop $cropsize $filename "$basename$shotnum-%d.jpg"
+		lappend imagemagicks $spawn_id
+		set imagemagics_spawn($spawn_id) $shotnum
+		set frame($shotnum) [list screen_width $screen_width \
+					 screen_height $screen_height \
+					 basename $basename]
+	    } else {
+		puts "Skipping frame $shotnum because conversion is behind schedule."
+	    }
+	}
+	-i $imagemagicks eof {
+	    set s $expect_out(spawn_id)
+	    set pos [lsearch $imagemagicks $s]
+	    set imagemagicks  [lreplace $imagemagicks $pos $pos]
+	    set shotnum $imagemagics_spawn($s)
+	    puts "Image from frame $shotnum has been chopped. <--|-->"
+	    unset imagemagics_spawn($s)
+	    wait -i $s
+	    array set myframe $frame($shotnum)
+	    spawn sh -c "md5sum $myframe(basename)$shotnum-*.jpg"
+	    lappend md5ings $spawn_id
+	    set md5spawn($spawn_id) $shotnum
+	}
+	-i $md5ings -regexp {([a-z0-9]{32})\s*([^\n]*)\n} {
+	    set source $expect_out(2,string)
+	    set tempfile "$params(tempdir)/$expect_out(1,string)"
+	    puts "rename $source to $tempfile"
+	    file rename -- $source $tempfile
+	    lappend file_upload_list $tempfile
+	    set hashes($source) $tempfile
+	    set invhashes($tempfile) $source
+	    upload_next_file
+	}
+	-i $md5ings eof {
+	    set s $expect_out(spawn_id)
+	    set pos [lsearch $md5ings $s]
+	    set md5ings [lreplace $md5ings $pos $pos]
+	    set shotnum $md5spawn($s)
+	    unset md5spawn($s)
+	    create_html $shotnum
+	    wait -i $s
+	}
+	-i $vncsnap eof { 
+	    create_final_html 
+	    wait -i $vncsnap
+	    set vncsnap {} 
+	}
 	timeout { die "Timeout waiting for response" }
-    }
+	}
 }
