@@ -1,12 +1,24 @@
 #!/usr/local/bin/expect
 
 # $Id$
+ 
+# To-do:
+# - check bandwidth usage
+# - status to show latency
+# - support VNC listen mode
+# - support other command-line arguments to vncsnapshot & sftp
+# - let things change dynamically by a console on stdin
+# - be able to disconnect, and control it from another application
+# - support uploading to several different sites at a time
+# - make subdirectories for hash-named files
+# - (eventually) perhaps do md5, vncsnapshot, convert -crop in-process
+
 
 set micro_image_width 64
 set micro_image_height 64
 set cropsize "${micro_image_width}x${micro_image_height}"
 
-set pause_between_frames 10
+set pause_between_frames 2
    # in seconds
 
 set required_params [list server destination baseurl]
@@ -49,6 +61,7 @@ if {[regexp {^sftp://([^/]*)/(.*)$} $params(destination) patternmatch destserver
 ######################################################################
 # Ready, steady, go!
 
+log_user 0
 file mkdir $params(tempdir)
 spawn vncsnapshot -count 10000000 \
     -fps $pause_between_frames \
@@ -82,6 +95,7 @@ proc upload_next_file {} {
     global destserver_cd
     global destdir
     global sftp
+
     if {[string is false $ready_to_send]} {
 	return
     }
@@ -92,7 +106,7 @@ proc upload_next_file {} {
 	set destserver_cd yes
 	return
     }
-    puts "Working through file_upload_list of $file_upload_list"
+    #puts "Working through file_upload_list of $file_upload_list"
     if {[llength $file_upload_list] > 0} {
 	set first_file [lindex $file_upload_list 0]
 	set file_upload_list [lrange $file_upload_list 1 end]
@@ -124,13 +138,14 @@ proc create_html {shotnum} {
     global micro_image_width
     global micro_image_height
     global hashes
-    global invhashes
     global file_upload_list
+    global pause_between_frames
     array set myframe $frame($shotnum)
     set htmlpath $params(tempdir)/page$shotnum.html
     set htmlfile [open $htmlpath w]
-    puts $htmlfile "<HTML><HEAD><TITLE>Page $shotnum</TITLE></HEAD>"
-    puts $htmlfile "<BODY><TABLE>"
+    puts $htmlfile "<HTML><HEAD><TITLE>Page $shotnum</TITLE>"
+    puts $htmlfile "<meta http-equiv=\"refresh\" content=\"$pause_between_frames\">"
+    puts $htmlfile "</HEAD><BODY><TABLE BORDER=0 CELLPADDING=0 CELLSPACING=0>"
     set row_width [expr $myframe(screen_width) / $micro_image_width]
     if {[expr $myframe(screen_width) % $micro_image_width] != 0} { incr row_width }
     set num_rows [expr $myframe(screen_height) / $micro_image_height]
@@ -139,12 +154,11 @@ proc create_html {shotnum} {
     for {set y 0} {$y < $num_rows} {incr y} {
 	puts $htmlfile "<TR>"
 	for {set x 0} {$x < $row_width} {incr x} {
-	    #set img_tail [file tail 
-	    #set img_source $params(baseurl)/$frame($shotnum
-	    puts $htmlfile "<TD>"
-	    #puts $htmlfile "<IMG SRC="
-	    # HAVE TO FINISH THIS BIT!!!!!
-	    puts $htmlfile "</TD>"
+	    set tailname $hashes($shotnum,$counter)
+	    set img_source "$params(baseurl)$tailname"
+	    puts $htmlfile "<TD><IMG SRC=\"$img_source\"></TD>"
+	    unset hashes($shotnum,$counter)
+	    incr counter
 	}
 	puts $htmlfile "</TR>"
     }
@@ -172,7 +186,7 @@ while {1} {
 	-i $sftp "The authenticity of host" { send -i $sftp "yes\n" }
 	-i $vncsnap "VNC authentication succeeded" { }
 	-i $sftp "sftp>" { set ready_to_send true ; upload_next_file }
-	-i $vncsnap -regexp {Image saved from .* (\d*)x(\d*) screen to (.*)(\d*).jpg using (\d*)x(\d*)\+(\d*)\+(\d*) rectangle} {
+	-i $vncsnap -regexp {Image saved from .* (\d*)x(\d*) screen to (.*?)(\d*).jpg using (\d*)x(\d*)\+(\d*)\+(\d*) rectangle} {
 	    set screen_width $expect_out(1,string)
 	    set screen_height $expect_out(2,string)
 	    set basename $expect_out(3,string)
@@ -190,7 +204,7 @@ while {1} {
 					 screen_height $screen_height \
 					 basename $basename]
 	    } else {
-		puts "Skipping frame $shotnum because conversion is behind schedule."
+		puts stderr "Skipping frame $shotnum because conversion is behind schedule."
 	    }
 	}
 	-i $imagemagicks eof {
@@ -198,7 +212,6 @@ while {1} {
 	    set pos [lsearch $imagemagicks $s]
 	    set imagemagicks  [lreplace $imagemagicks $pos $pos]
 	    set shotnum $imagemagics_spawn($s)
-	    puts "Image from frame $shotnum has been chopped. <--|-->"
 	    unset imagemagics_spawn($s)
 	    wait -i $s
 	    array set myframe $frame($shotnum)
@@ -206,23 +219,33 @@ while {1} {
 	    lappend md5ings $spawn_id
 	    set md5spawn($spawn_id) $shotnum
 	}
-	-i $md5ings -regexp {([a-z0-9]{32})\s*([^\n]*)\n} {
-	    set source $expect_out(2,string)
-	    set tempfile "$params(tempdir)/$expect_out(1,string)"
-	    puts "rename $source to $tempfile"
-	    file rename -- $source $tempfile
-	    lappend file_upload_list $tempfile
-	    set hashes($source) $tempfile
-	    set invhashes($tempfile) $source
-	    upload_next_file
+	-i $md5ings -re {([a-z0-9]{32})\s+([^\r]*?)(\d+)-(\d+).([^.\r]*?)\r} {
+	    set s $expect_out(spawn_id)
+	    # I could also get shotnum from md5spawn($s)
+	    set hash $expect_out(1,string)
+	    set source_base $expect_out(2,string)
+	    set shotnum $expect_out(3,string)
+	    set seqnum $expect_out(4,string)
+	    set fileext $expect_out(5,string)
+	    set source "$source_base$shotnum-$seqnum.$fileext"
+	    set tempfile "$params(tempdir)/$hash.$fileext"
+	    set hashes($shotnum,$seqnum) "$hash.$fileext"
+	    if {[info exists previously_uploaded($tempfile)]} {
+		# don't bother resending.
+	    } else {
+		file rename -force $source $tempfile
+		lappend file_upload_list $tempfile
+		upload_next_file
+		set previously_uploaded($tempfile) 1
+	    }
 	}
 	-i $md5ings eof {
 	    set s $expect_out(spawn_id)
 	    set pos [lsearch $md5ings $s]
 	    set md5ings [lreplace $md5ings $pos $pos]
 	    set shotnum $md5spawn($s)
-	    unset md5spawn($s)
 	    create_html $shotnum
+	    unset md5spawn($s)
 	    wait -i $s
 	}
 	-i $vncsnap eof { 
